@@ -95,6 +95,36 @@ describe('applyDisplay', () => {
     expect($uiState.get().destructiveSlashConfirm).toBe(false)
   })
 
+  it('hydrates generation_timing as an opt-in boolean (fail-safe off)', () => {
+    const setBell = vi.fn()
+
+    // Missing key → off (default).
+    applyDisplay({ config: { display: {} } }, setBell)
+    expect($uiState.get().generationTiming).toBe(false)
+
+    // Explicit true → on.
+    applyDisplay({ config: { display: { generation_timing: true } } }, setBell)
+    expect($uiState.get().generationTiming).toBe(true)
+
+    // Explicit false → off.
+    applyDisplay({ config: { display: { generation_timing: false } } }, setBell)
+    expect($uiState.get().generationTiming).toBe(false)
+
+    // Strict === true: a truthy non-boolean must NOT turn the feature on.
+    applyDisplay({ config: { display: { generation_timing: 'yes' as unknown as boolean } } }, setBell)
+    expect($uiState.get().generationTiming).toBe(false)
+  })
+
+  it('coerces legacy true + "on" alias to top', () => {
+    const setBell = vi.fn()
+
+    applyDisplay({ config: { display: { tui_statusbar: true as unknown as 'on' } } }, setBell)
+    expect($uiState.get().statusBar).toBe('top')
+
+    applyDisplay({ config: { display: { tui_statusbar: 'on' } } }, setBell)
+    expect($uiState.get().statusBar).toBe('top')
+  })
+
   it('applies v1 parity defaults when display fields are missing', () => {
     const setBell = vi.fn()
 

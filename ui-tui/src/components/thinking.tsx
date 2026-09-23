@@ -19,6 +19,9 @@ import {
   boundedLiveRenderText,
   compactPreview,
   estimateTokensRough,
+  fmtDecode,
+  fmtGenDuration,
+  fmtPrefill,
   formatToolCall,
   formatToolLabels,
   parseToolTrailResultLine,
@@ -683,6 +686,79 @@ interface Group {
   label: string
 }
 
+// Live prefill ticker: shown from the instant the user submits until the
+// first token arrives, so the ↑ time-to-first-token counts up live during
+// the wait — before any thinking/text segment exists to carry it. Once the
+// first delta lands, `prefillStartMs` clears, this unmounts, and the real
+// segment takes over with a frozen ↑ prefill and a ↓ decode starting at 0.
+export const LivePrefillLine = memo(function LivePrefillLine({
+  startMs,
+  t
+}: {
+  startMs: number
+  t: Theme
+}) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 200)
+
+    return () => clearInterval(id)
+  }, [])
+
+  const label = fmtPrefill(Math.max(0, now - startMs))
+
+  return (
+    <Box>
+      <Text color={t.color.muted}>
+        <Text color={t.color.accent}>▸ </Text>
+        <Spinner color={t.color.accent} variant="think" /> <Text bold color={t.color.text}>Thinking</Text>
+        {label ? (
+          <Text color={t.color.statusFg} dim>
+            {'  '}
+            {label}
+          </Text>
+        ) : null}
+      </Text>
+    </Box>
+  )
+})
+
+// Live line for an in-progress context compaction (summarization). Shown
+// while the `compacting` status is live; on completion the controller
+// records a settled trail line with the total duration.
+export const LiveCompactionLine = memo(function LiveCompactionLine({
+  startMs,
+  t
+}: {
+  startMs: number
+  t: Theme
+}) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 200)
+
+    return () => clearInterval(id)
+  }, [])
+
+  return (
+    <Box>
+      <Text color={t.color.muted}>
+        <Text color={t.color.accent}>▸ </Text>
+        <Spinner color={t.color.accent} variant="think" />{' '}
+        <Text bold color={t.color.text}>
+          Compacting context
+        </Text>
+        <Text color={t.color.statusFg} dim>
+          {'  '}
+          {fmtGenDuration(Math.max(0, now - startMs))}
+        </Text>
+      </Text>
+    </Box>
+  )
+})
+
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
   commandOverride = false,
@@ -697,8 +773,15 @@ export const ToolTrail = memo(function ToolTrail({
   sections,
   subagents = [],
   t,
+  thinkingDurationMs,
+  thinkingPrefillMs,
+  livePrefillStartMs,
+  thinkingPrefillNewTokens,
+  generationTiming = false,
   tools = [],
   toolTokens,
+  toolGenDurationMs,
+  toolGenTokens,
   trail = [],
   activity = []
 }: {
@@ -718,8 +801,28 @@ export const ToolTrail = memo(function ToolTrail({
   sections?: SectionVisibility
   subagents?: SubagentProgress[]
   t: Theme
+  // Wall-clock ms the reasoning block took to generate (see Msg.thinkingDurationMs).
+  thinkingDurationMs?: number
+  // Time-to-first-token for the reasoning block (see Msg.thinkingPrefillMs).
+  thinkingPrefillMs?: number
+  // Live prefill clock start (prefillStartMs), passed only for the live
+  // thinking block while the clock is armed and not yet frozen. The header
+  // ticks ↑ from this until `thinkingPrefillMs` lands, so the ↑ clock lives
+  // in one place (the header) instead of a separate bottom ticker.
+  livePrefillStartMs?: number
+  // `display.generation_timing` — master switch for all timing-derived
+  // output (↑ prefill / ↓ decode / tok/s on the thinking and tool-arg
+  // headers). Token counts are NOT gated: they predate the timing feature.
+  generationTiming?: boolean
+  // Cache-miss prompt tokens of the call this block's prefill waited on
+  // (see Msg.thinkingPrefillNewTokens).
+  thinkingPrefillNewTokens?: number
   tools?: ActiveTool[]
   toolTokens?: number
+  // Tool-argument generation window (see Msg.toolGenDurationMs /
+  // toolGenTokens): rendered as a decode rate on the "Tool calls" header.
+  toolGenDurationMs?: number
+  toolGenTokens?: number
   trail?: string[]
   activity?: ActivityItem[]
 }) {
@@ -755,6 +858,21 @@ export const ToolTrail = memo(function ToolTrail({
   const [openSubagents, setOpenSubagents] = useState(visible.subagents === 'expanded')
   const [deepSubagents, setDeepSubagents] = useState(visible.subagents === 'expanded')
   const [openMeta, setOpenMeta] = useState(visible.activity === 'expanded')
+
+  // Ticker for the live ↑ prefill clock hosted on the thinking header.
+  // Runs only while the prefill clock is armed and not yet frozen into
+  // `thinkingPrefillMs` (i.e. during the wait for the first token). Once
+  // the first token lands, `thinkingPrefillMs` is set and this stops — the
+  // header then shows the frozen value in the same place, no jump.
+  useEffect(() => {
+    if (!generationTiming || livePrefillStartMs === undefined || thinkingPrefillMs !== undefined) {
+      return
+    }
+
+    const id = setInterval(() => setNow(Date.now()), 200)
+
+    return () => clearInterval(id)
+  }, [generationTiming, livePrefillStartMs, thinkingPrefillMs])
 
   useEffect(() => {
     if (!tools.length || (visible.tools !== 'expanded' && !openTools)) {
@@ -938,8 +1056,39 @@ export const ToolTrail = memo(function ToolTrail({
   const totalTokenCount = tokenCount + toolTokenCount
   const thinkingTokensLabel = tokenCount > 0 ? `~${compactNumber(tokenCount)} tokens` : null
 
-  const toolTokensLabel =
-    toolTokens !== undefined && toolTokens > 0 ? `~${compactNumber(toolTokens)} tokens` : undefined
+  // Phase split: ↑ prefill (time-to-first-token) · ↓ decode (with
+  // throughput). Once frozen, `thinkingPrefillMs` carries the value. While
+  // the clock is still armed (no first token yet), tick live from
+  // `livePrefillStartMs` so the ↑ clock lives on this header rather than a
+  // separate bottom ticker.
+  const livePrefillMs =
+    generationTiming && thinkingPrefillMs === undefined && livePrefillStartMs !== undefined
+      ? Math.max(0, now - livePrefillStartMs)
+      : undefined
+
+  const thinkingMeta = [
+    thinkingTokensLabel,
+    generationTiming ? fmtPrefill(thinkingPrefillMs ?? livePrefillMs, thinkingPrefillNewTokens) : '',
+    generationTiming ? fmtDecode(thinkingDurationMs, tokenCount) : ''
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+  // Tool-calls header suffix: the generated tool-argument token count and
+  // the generation rate, both from the same per-call window (pendingToolGen)
+  // so the count and the rate reconcile. Rendered as
+  // `~95 tok · ↓ 2.1s decode · ~45 tok/s`. The rate half is timing-derived and
+  // gated on `generationTiming`; the bare token count is not.
+  const toolGenLabel =
+    toolGenTokens !== undefined && toolGenTokens > 0
+      ? `~${compactNumber(toolGenTokens)} tok${
+          generationTiming && toolGenDurationMs !== undefined
+            ? ` · ${fmtDecode(toolGenDurationMs, toolGenTokens)}`
+            : ''
+        }`
+      : undefined
+
+  const toolTokensLabel = toolGenLabel
 
   const totalTokensLabel = tokenCount > 0 && toolTokenCount > 0 ? `~${compactNumber(totalTokenCount)} total` : null
   const delegateGroups = groups.filter(g => g.label.startsWith('Delegate Task'))
@@ -1066,10 +1215,10 @@ export const ToolTrail = memo(function ToolTrail({
                 Thinking
               </Text>
             )}
-            {thinkingTokensLabel ? (
+            {thinkingMeta ? (
               <Text color={t.color.statusFg} dim>
                 {'  '}
-                {thinkingTokensLabel}
+                {thinkingMeta}
               </Text>
             ) : null}
           </Text>

@@ -51,6 +51,52 @@ export const compactPreview = (s: string, max: number) => {
 
 export const estimateTokensRough = (text: string) => (!text ? 0 : (text.length + 3) >> 2)
 
+// Generation-time labels for thinking/response blocks, mirroring the
+// "(1.5s)" shape tools already wear. Sub-10s keeps one decimal so a
+// snappy reply doesn't round to "0s".
+export const fmtGenDuration = (ms: number) => {
+  const sec = Math.max(0, ms) / 1000
+
+  return sec < 10 ? `${sec.toFixed(1)}s` : `${Math.round(sec)}s`
+}
+
+// Below ~500ms the estimate is dominated by batching jitter, not model
+// speed — suppress rather than show a wild rate.
+export const fmtTokensPerSec = (tokens: number, ms: number) =>
+  tokens > 0 && ms > 500 ? `~${Math.round(tokens / (ms / 1000))} tok/s` : null
+
+// Phase-aware generation labels. ↑ = prefill (time-to-first-token: model-call
+// start → first delta; measured client-side). When the server reported the
+// call's real prompt accounting (usage.last_call), the label carries the
+// cache-miss token count and the derived prefill rate — the wall-clock TTFT
+// alone can't tell a 50-token warm call from a 30k cold one.
+// ↓ = decode (first delta → seal, with throughput).
+export const fmtPrefill = (ms: number | undefined, newTokens?: number) => {
+  if (ms === undefined || ms <= 0) {
+    return null
+  }
+
+  if (newTokens === undefined) {
+    return `↑ ${fmtGenDuration(ms)} prefill`
+  }
+
+  const rate = fmtTokensPerSec(newTokens, ms)
+
+  return rate
+    ? `↑ ${fmtGenDuration(ms)} prefill · ${compactNumber(newTokens)} new · ${rate}`
+    : `↑ ${fmtGenDuration(ms)} prefill · ${compactNumber(newTokens)} new`
+}
+
+export const fmtDecode = (ms: number | undefined, tokens = 0) => {
+  if (ms === undefined) {
+    return null
+  }
+
+  const rate = fmtTokensPerSec(tokens, ms)
+
+  return rate ? `↓ ${fmtGenDuration(ms)} decode · ${rate}` : `↓ ${fmtGenDuration(ms)} decode`
+}
+
 export const edgePreview = (s: string, head = 16, tail = 28) => {
   const one = s.replace(WS_RE, ' ').trim().replace(/\]\]/g, '] ]')
 

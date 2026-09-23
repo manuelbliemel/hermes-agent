@@ -13,6 +13,7 @@ import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
   boundedLiveRenderText,
   estimateTokensRough,
+  fmtGenDuration,
   formatToolCall,
   formatToolLabel,
   isTransientTrailLine,
@@ -153,8 +154,62 @@ class TurnController {
   toolTokenAcc = 0
   turnTools: string[] = []
 
+  // Per-model-call tool-argument generation window. `tool.generating` fires
+  // on the first arg token, `tool.start` when the args finish parsing and
+  // dispatch. The span between them is the model's tool-JSON generation
+  // phase. `pendingToolGen` accumulates the window across the call's tools
+  // and survives armPrefillClock's per-call reset, so the shelf that
+  // materializes later (at tool.complete flush or the final details row)
+  // still carries the generation rate of the call(s) that produced it.
+  private toolGenStartMs: null | number = null
+  private toolGenEndMs: null | number = null
+  private pendingToolGen: { durationMs: number; tokens: number } = { durationMs: 0, tokens: 0 }
+  // Auxiliary compaction (context summarization) runs between the prefill
+  // clock arming and the real API call. Its wall-clock must NOT fold into
+  // the next block's ↑ prefill, so beginCompaction pauses the prefill clock
+  // and endCompaction re-arms it (measuring the real call from after the
+  // summarization) and records the compaction as its own timed trail line.
+  private compactionStartMs: null | number = null
+
   private activeTools: ActiveTool[] = []
   private activeReasoningText = ''
+  // First-delta timestamps for the currently-open blocks; consumed into
+  // `thinkingDurationMs` / `textDurationMs` when the block seals. Null
+  // means "no block open" so a later segment never inherits an earlier
+  // segment's clock.
+  private reasoningStartMs: null | number = null
+  private textStreamStartMs: null | number = null
+  // Last-delta timestamps for the open blocks. The decode window ends at the
+  // block's OWN last token, not at the next event: `tool.start` fires only
+  // after the model finished streaming the whole tool-call JSON, so a
+  // reasoning→tool turn with no prose in between would otherwise charge the
+  // reasoning block for the entire tool-arg generation (a 28-token block
+  // reading ~4 tok/s over a 7.5s window). During live streaming the last
+  // delta is ~now, so the live counters are unaffected; the correction only
+  // shows at seal time.
+  private reasoningLastDeltaMs: null | number = null
+  private textLastDeltaMs: null | number = null
+  // When the CURRENT model call began (turn start / previous tool completion).
+  // The first delta of any kind consumes it into a prefill duration
+  // (time-to-first-token) on the block that starts streaming. Null after
+  // consumption until the next call boundary.
+  private modelCallStartMs: null | number = null
+  // Which block kind consumed the CURRENT call's prefill clock ('reasoning'
+  // | 'text'). Cleared by armPrefillClock so it always names the block that
+  // belongs to the LAST model call — the one `usage.last_call` describes at
+  // message.complete. Null when no block has consumed the current clock.
+  private prefillConsumedBy: null | 'reasoning' | 'text' = null
+  private reasoningPrefillMs: number | undefined = undefined
+  private textPrefillMs: number | undefined = undefined
+  // Completed reasoning bursts for the CURRENT segment, folded in by
+  // freezeReasoningClock(). A new segment resets it to 0 so each thinking
+  // block reports only its own time; the running burst adds on top.
+  private reasoningSegmentBaseMs = 0
+  // True once a real model token (reasoning.delta / reasoning.available) has
+  // opened the clock for the current segment. Distinguishes "measured, maybe
+  // 0ms" from "never started" (status-only thinking.delta) so syncReasoningSegment
+  // only stamps durations on blocks that actually streamed.
+  private reasoningClockStarted = false
   private reasoningSegmentIndex: null | number = null
   private interimBoundaryIndex: null | number = null
   private activityId = 0
@@ -191,6 +246,11 @@ class TurnController {
     this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
     this.reasoningText = ''
+    this.reasoningStartMs = null
+    this.reasoningLastDeltaMs = null
+    this.reasoningSegmentBaseMs = 0
+    this.reasoningClockStarted = false
+    this.reasoningPrefillMs = undefined
     this.toolTokenAcc = 0
     patchTurnState({ reasoning: '', reasoningTokens: 0, toolTokens: 0 })
   }
@@ -296,6 +356,11 @@ class TurnController {
   endReasoningPhase() {
     this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
 
+    // Freeze the thinking clock BEFORE sealing: endReasoningPhase fires on
+    // every message.delta, so without this the block's duration would keep
+    // growing with the text stream's time until message.complete.
+    this.freezeReasoningClock()
+
     // Seal any open reasoning segment so its isLiveReasoning flag drops the
     // moment the reasoning phase ends — the panel must stop tracking the
     // turn's global reasoningActive, not stay "live" for the rest of the turn.
@@ -311,12 +376,19 @@ class TurnController {
     this.activeTools = []
     this.streamTimer = clear(this.streamTimer)
     this.bufRef = ''
+    this.textStreamStartMs = null
+    this.textLastDeltaMs = null
+    this.textPrefillMs = undefined
+    this.modelCallStartMs = null
+    this.prefillConsumedBy = null
     this.pendingSegmentTools = []
     this.segmentMessages = []
 
     patchTurnState({
       streamPendingTools: [],
       streamSegments: [],
+      streamTiming: null,
+      prefillStartMs: null,
       streaming: '',
       subagents: [],
       tools: [],
@@ -396,6 +468,95 @@ class TurnController {
     })
   }
 
+  // Total reasoning time for the current segment: completed bursts folded
+  // in by freezeReasoningClock() plus the still-running burst, measured to
+  // the block's last token (not the freeze moment — see reasoningLastDeltaMs).
+  private reasoningElapsedMs() {
+    if (this.reasoningStartMs === null) {
+      return this.reasoningSegmentBaseMs
+    }
+
+    return this.reasoningSegmentBaseMs + (this.reasoningLastDeltaMs ?? Date.now()) - this.reasoningStartMs
+  }
+
+  // Mark the start of the next model call (turn start, or a tool result
+  // going back to the model). The first delta that arrives consumes it as
+  // that block's prefill (time-to-first-token). Public so the submit path
+  // can anchor it at the user's actual "I want output now" moment — the
+  // gateway's message.start can land too close to the first delta to
+  // capture the prefill wait on its own.
+  armPrefillClock() {
+    this.modelCallStartMs = Date.now()
+    // A new model call begins: the previous call's attribution no longer
+    // matches the `usage.last_call` that will arrive next.
+    this.prefillConsumedBy = null
+    // Drop the previous call's OPEN generation window so a later shelf
+    // can't inherit a stale start. `pendingToolGen` is NOT reset here —
+    // it carries the accumulated window until the shelf materializes.
+    this.toolGenStartMs = null
+    this.toolGenEndMs = null
+    // Mirror into the store so the Thinking header can tick ↑ live during
+    // the wait (before any delta exists to create a segment).
+    patchTurnState({ prefillStartMs: this.modelCallStartMs })
+  }
+
+  // `tool.generating` fires on the first token of a tool call's argument
+  // JSON. Open the per-call generation window (first one wins; parallel
+  // tools share the single contiguous generation phase).
+  recordToolGenerating() {
+    if (this.interrupted || this.toolGenStartMs !== null) {
+      return
+    }
+
+    this.toolGenStartMs = Date.now()
+  }
+
+  // Auxiliary context compaction (summarization) started. Pause the prefill
+  // clock so the summarization's wall-clock is NOT charged to the next
+  // block's ↑ prefill; the real call will re-arm on endCompaction.
+  beginCompaction() {
+    if (this.interrupted || this.compactionStartMs !== null) {
+      return
+    }
+
+    this.compactionStartMs = Date.now()
+    this.modelCallStartMs = null
+    patchTurnState({ prefillStartMs: null, compactionStartMs: this.compactionStartMs })
+  }
+
+  // Compaction finished: record it as its own timed trail line (real,
+  // billed time worth surfacing) and re-arm the prefill clock so the next
+  // real API call measures its TTFT from after the summarization. Returns
+  // the compaction duration (ms) so the handler can surface it as a
+  // visible transcript line; null if there was no open compaction.
+  endCompaction(): number | null {
+    if (this.compactionStartMs === null) {
+      return null
+    }
+
+    const ms = Date.now() - this.compactionStartMs
+    this.compactionStartMs = null
+    patchTurnState({ compactionStartMs: null })
+    this.pushTrail(`🗜️ Context compaction · ${fmtGenDuration(ms)}`)
+    this.armPrefillClock()
+
+    return ms
+  }
+
+  private consumePrefillMs(kind: 'reasoning' | 'text'): number | undefined {
+    if (this.modelCallStartMs === null) {
+      return undefined
+    }
+
+    const ms = Date.now() - this.modelCallStartMs
+
+    this.modelCallStartMs = null
+    this.prefillConsumedBy = kind
+    patchTurnState({ prefillStartMs: null })
+
+    return ms
+  }
+
   private syncReasoningSegment(live = true) {
     const thinking = this.activeReasoningText.trim()
 
@@ -409,6 +570,8 @@ class TurnController {
       text: '',
       thinking,
       thinkingTokens: estimateTokensRough(thinking),
+      ...(this.reasoningClockStarted ? { thinkingDurationMs: this.reasoningElapsedMs() } : {}),
+      ...(this.reasoningPrefillMs !== undefined ? { thinkingPrefillMs: this.reasoningPrefillMs } : {}),
       toolTokens: this.toolTokenAcc || undefined,
       ...(live ? { isLiveReasoning: true } : {})
     }
@@ -423,10 +586,26 @@ class TurnController {
     patchTurnState({ streamSegments: this.segmentMessages })
   }
 
+  // Fold the running reasoning burst into the segment's total and stop the
+  // clock. Idempotent: a second call with no open burst changes nothing.
+  private freezeReasoningClock() {
+    if (this.reasoningStartMs !== null) {
+      this.reasoningSegmentBaseMs += (this.reasoningLastDeltaMs ?? Date.now()) - this.reasoningStartMs
+      this.reasoningStartMs = null
+      this.reasoningLastDeltaMs = null
+    }
+  }
+
   private closeReasoningSegment() {
+    this.freezeReasoningClock()
     this.syncReasoningSegment(false)
     this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
+    // The segment is archived with its duration; the next block starts a
+    // fresh clock so blocks never inherit each other's time.
+    this.reasoningSegmentBaseMs = 0
+    this.reasoningClockStarted = false
+    this.reasoningPrefillMs = undefined
   }
 
   private pushSegment(msg: Msg) {
@@ -453,6 +632,12 @@ class TurnController {
       role: split.text ? 'assistant' : 'system',
       text: split.text,
       ...(!split.text && { kind: 'trail' as const }),
+      ...(split.text && this.textStreamStartMs !== null
+        ? {
+            textDurationMs: (this.textLastDeltaMs ?? Date.now()) - this.textStreamStartMs,
+            ...(this.textPrefillMs !== undefined ? { textPrefillMs: this.textPrefillMs } : {})
+          }
+        : {}),
       ...(this.pendingSegmentTools.length && { tools: this.pendingSegmentTools })
     }
 
@@ -464,7 +649,8 @@ class TurnController {
 
     this.pendingSegmentTools = []
     this.bufRef = ''
-    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages, streaming: '' })
+    this.textStreamStartMs = null
+    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages, streamTiming: null, streaming: '' })
   }
 
   pulseReasoningStreaming() {
@@ -498,7 +684,8 @@ class TurnController {
       kind: 'trail',
       role: 'system',
       text: '',
-      tools: this.pendingSegmentTools
+      tools: this.pendingSegmentTools,
+      ...this.toolGenFields()
     })
 
     if (next.length === this.segmentMessages.length + 1) {
@@ -507,12 +694,19 @@ class TurnController {
 
     this.segmentMessages = next
     this.pendingSegmentTools = []
-    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages })
+    // The shelf materialized here consumed the accumulated window — clear it
+    // (and the store mirror) so a later live block can't show a stale rate.
+    this.pendingToolGen = { durationMs: 0, tokens: 0 }
+    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages, toolGenDurationMs: null, toolGenTokens: 0 })
 
     return true
   }
 
-  pushInlineDiffSegment(diffText: string, tools: string[] = []) {
+  pushInlineDiffSegment(
+    diffText: string,
+    tools: string[] = [],
+    genFields?: Pick<Msg, 'toolGenDurationMs' | 'toolGenTokens'>
+  ) {
     // Strip CLI chrome the gateway emits before the unified diff (e.g. a
     // leading "┊ review diff" header written by `_emit_inline_diff` for the
     // terminal printer). That header only makes sense as stdout dressing,
@@ -541,7 +735,7 @@ class TurnController {
 
     this.segmentMessages = [
       ...this.segmentMessages,
-      { kind: 'diff', role: 'assistant', text: block, ...(tools.length && { tools }) }
+      { kind: 'diff', role: 'assistant', text: block, ...(tools.length && { tools }), ...genFields }
     ]
     patchTurnState({ streamSegments: this.segmentMessages })
   }
@@ -594,6 +788,23 @@ class TurnController {
   }
 
   recordMessageComplete(payload: MessageCompletePayload) {
+    // Capture the open blocks' clocks BEFORE closeReasoningSegment() seals
+    // and resets them: the final assistant tail and the trailing details
+    // row are stamped from the same stream that just finished.
+    const finalReasoningDurationMs =
+      this.reasoningStartMs !== null || this.reasoningSegmentBaseMs > 0 ? this.reasoningElapsedMs() : undefined
+
+    const finalTextDurationMs =
+      this.textStreamStartMs !== null
+        ? (this.textLastDeltaMs ?? Date.now()) - this.textStreamStartMs
+        : undefined
+    const finalReasoningPrefillMs = this.reasoningPrefillMs
+    const finalTextPrefillMs = this.textPrefillMs
+    // The server's report for the LAST model call: how many prompt tokens
+    // actually went through prefill (prompt - cache_read).
+    const lastCallNew = payload.usage?.last_call?.new
+    const lastCallNewTokens = typeof lastCallNew === 'number' && lastCallNew > 0 ? lastCallNew : undefined
+
     this.closeReasoningSegment()
 
     // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI
@@ -648,13 +859,34 @@ class TurnController {
 
     const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim()
 
+    // The reasoning/text block that consumed the last call's prefill clock
+    // may already be sealed inside `segments` (common when the turn made
+    // several model calls). Stamp the server-reported count onto the LAST
+    // segment carrying that block's prefill — except when the final row
+    // itself carries the prefill (then it gets the stamp directly and an
+    // earlier text segment must not absorb an older call's count).
+    const prefillNewForReasoning =
+      lastCallNewTokens !== undefined && this.prefillConsumedBy === 'reasoning'
+
+    const prefillNewForText = lastCallNewTokens !== undefined && this.prefillConsumedBy === 'text'
+    const textCarriesPrefill = Boolean(finalText) && finalTextPrefillMs !== undefined
+
+    const stampedSegments =
+      prefillNewForText && textCarriesPrefill ? segments : this.stampPrefillSegment(segments, lastCallNewTokens)
+
     const finalDetails: Msg = {
       kind: 'trail',
       role: 'system',
       text: '',
       thinking: finalThinking || undefined,
       thinkingTokens: finalThinking ? estimateTokensRough(finalThinking) : undefined,
+      ...(finalThinking && finalReasoningDurationMs !== undefined ? { thinkingDurationMs: finalReasoningDurationMs } : {}),
+      ...(finalThinking && finalReasoningPrefillMs !== undefined ? { thinkingPrefillMs: finalReasoningPrefillMs } : {}),
+      ...(finalThinking && finalReasoningPrefillMs !== undefined && prefillNewForReasoning
+        ? { thinkingPrefillNewTokens: lastCallNewTokens }
+        : {}),
       toolTokens: savedToolTokens || undefined,
+      ...this.toolGenFields(),
       ...(tools.length && { tools })
     }
 
@@ -662,12 +894,18 @@ class TurnController {
     // not between thinking/tools and final assistant text.
     const finalMessages: Msg[] = [
       ...archiveDoneTodos(),
-      ...segments,
+      ...stampedSegments,
       ...(hasDetails(finalDetails) ? [finalDetails] : [])
     ]
 
     if (finalText) {
-      finalMessages.push({ role: 'assistant', text: finalText })
+      finalMessages.push({
+        role: 'assistant',
+        text: finalText,
+        ...(finalTextDurationMs !== undefined ? { textDurationMs: finalTextDurationMs } : {}),
+        ...(finalTextPrefillMs !== undefined ? { textPrefillMs: finalTextPrefillMs } : {}),
+        ...(finalTextPrefillMs !== undefined && prefillNewForText ? { textPrefillNewTokens: lastCallNewTokens } : {})
+      })
     }
 
     const wasInterrupted = this.interrupted
@@ -714,6 +952,18 @@ class TurnController {
     // fragment), which on every tick discarded everything streamed so far
     // — visible as overlapping coloured text and lost prose under
     // `display.final_response_markdown: render`.
+    if (!this.bufRef) {
+      this.textStreamStartMs = Date.now()
+      this.textLastDeltaMs = this.textStreamStartMs
+      // First text token of this model call → its prefill (TTFT). If
+      // reasoning already consumed the clock this call, this is undefined
+      // and the text block shows decode only — correct, since the prefill
+      // was reported on the thinking block.
+      this.textPrefillMs = this.consumePrefillMs('text')
+    } else {
+      this.textLastDeltaMs = Date.now()
+    }
+
     this.bufRef += text
 
     if (getUiState().streaming) {
@@ -735,6 +985,11 @@ class TurnController {
     // If the streaming buffer hasn't caught up to the authoritative interim
     // text (e.g. the backend didn't stream every token), sync it so the
     // sealed segment matches what the user should see.
+    if (!this.bufRef) {
+      this.textStreamStartMs = Date.now()
+      this.textPrefillMs = this.consumePrefillMs('text')
+    }
+
     if (this.bufRef.trimStart() !== authoritativeText) {
       this.bufRef = authoritativeText
     }
@@ -760,6 +1015,10 @@ class TurnController {
 
     this.reasoningText = incoming
     this.activeReasoningText = incoming
+    this.reasoningStartMs = Date.now()
+    this.reasoningLastDeltaMs = this.reasoningStartMs
+    this.reasoningClockStarted = true
+    this.reasoningPrefillMs = this.consumePrefillMs('reasoning')
     this.scheduleReasoning()
     this.syncReasoningSegment()
     this.pulseReasoningStreaming()
@@ -798,13 +1057,30 @@ class TurnController {
     patchTurnState({ streamSegments: this.segmentMessages })
   }
 
-  recordReasoningDelta(text: string, force = false) {
+  // `startsClock` is false for status-only text (the `thinking.delta`
+  // spinner "◉ pondering..." fired by the agent right before the API call).
+  // That text is not a model token, so it must not open the prefill/decode
+  // clock.
+  recordReasoningDelta(text: string, force = false, startsClock = true) {
     if (this.interrupted || (!force && !getUiState().showReasoning)) {
       return
     }
 
     if (!this.activeReasoningText.trim() && this.pendingSegmentTools.length) {
       this.flushStreamingSegment()
+    }
+
+    // (Re)start the clock whenever it's idle: a fresh segment OR reasoning
+    // resuming after the text stream froze it. The segment base holds the
+    // earlier bursts so resumed time adds, never replaces.
+    if (startsClock && this.reasoningStartMs === null) {
+      this.reasoningStartMs = Date.now()
+      this.reasoningLastDeltaMs = this.reasoningStartMs
+      this.reasoningClockStarted = true
+      // First reasoning token of this model call → its prefill (TTFT).
+      this.reasoningPrefillMs = this.consumePrefillMs('reasoning')
+    } else if (startsClock) {
+      this.reasoningLastDeltaMs = Date.now()
     }
 
     this.reasoningText += text
@@ -826,7 +1102,8 @@ class TurnController {
     duration?: number,
     todos?: unknown,
     resultText?: string,
-    labels?: ToolLabel[]
+    labels?: ToolLabel[],
+    lastCallNewTokens?: number
   ) {
     if (this.interrupted) {
       return
@@ -834,10 +1111,49 @@ class TurnController {
 
     this.recordTodos(todos)
     const lines = this.completeTool(toolId, fallbackName, summary, duration, resultText, labels)
+    // The model call that produced this tool has settled: stamp the block
+    // that waited on its prefill NOW, so earlier blocks in a multi-call turn
+    // don't wait for turn end. Must run BEFORE armPrefillClock, which clears
+    // the attribution that names the block.
+    const stamped = this.stampPrefillSegment(this.segmentMessages, lastCallNewTokens)
+
+    if (stamped !== this.segmentMessages) {
+      this.segmentMessages = stamped
+      patchTurnState({ streamSegments: this.segmentMessages })
+    }
+
+    // The tool result goes back to the model now — arm the prefill clock so
+    // the next block that streams reports its time-to-first-token. The
+    // accumulated generation window lives in `pendingToolGen`, which
+    // survives the reset, so the shelf still carries the rate.
+    this.armPrefillClock()
 
     this.pendingSegmentTools = [...this.pendingSegmentTools, ...lines]
     this.flushPendingToolsIntoLastSegment()
     this.publishToolState()
+  }
+
+  // Stamp the server-reported cache-miss token count onto the LAST segment
+  // that carries the prefill for the block kind that consumed the current
+  // call's clock (prefillConsumedBy). Returns a new array when it stamps;
+  // no-op without a count or attribution.
+  private stampPrefillSegment(msgs: Msg[], newTokens?: number): Msg[] {
+    if (newTokens === undefined || newTokens <= 0 || this.prefillConsumedBy === null) {
+      return msgs
+    }
+
+    const [prefillKey, tokensKey] =
+      this.prefillConsumedBy === 'reasoning'
+        ? (['thinkingPrefillMs', 'thinkingPrefillNewTokens'] as const)
+        : (['textPrefillMs', 'textPrefillNewTokens'] as const)
+
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i][prefillKey] !== undefined) {
+        return [...msgs.slice(0, i), { ...msgs[i], [tokensKey]: newTokens }, ...msgs.slice(i + 1)]
+      }
+    }
+
+    return msgs
   }
 
   recordInlineDiffToolComplete(
@@ -846,14 +1162,32 @@ class TurnController {
     fallbackName?: string,
     duration?: number,
     resultText?: string,
-    labels?: ToolLabel[]
+    labels?: ToolLabel[],
+    lastCallNewTokens?: number
   ) {
     if (this.interrupted) {
       return
     }
 
     this.flushStreamingSegment()
-    this.pushInlineDiffSegment(diffText, this.completeTool(toolId, fallbackName, '', duration, resultText, labels))
+    // Materialize the accumulated generation window onto the diff segment,
+    // then clear it so the final details row doesn't double-count.
+    this.pushInlineDiffSegment(
+      diffText,
+      this.completeTool(toolId, fallbackName, '', duration, resultText, labels),
+      this.toolGenFields()
+    )
+    this.pendingToolGen = { durationMs: 0, tokens: 0 }
+    patchTurnState({ toolGenDurationMs: null, toolGenTokens: 0 })
+    // Same per-call boundary as recordToolComplete: stamp before re-arming.
+    const stamped = this.stampPrefillSegment(this.segmentMessages, lastCallNewTokens)
+
+    if (stamped !== this.segmentMessages) {
+      this.segmentMessages = stamped
+      patchTurnState({ streamSegments: this.segmentMessages })
+    }
+
+    this.armPrefillClock()
     this.publishToolState()
   }
 
@@ -897,7 +1231,14 @@ class TurnController {
     })
   }
 
-  recordToolStart(toolId: string, name: string, context: string, verboseArgs?: string, labels?: ToolLabel[]) {
+  recordToolStart(
+    toolId: string,
+    name: string,
+    context: string,
+    verboseArgs?: string,
+    labels?: ToolLabel[],
+    argsJson?: string
+  ) {
     if (this.interrupted) {
       return
     }
@@ -907,12 +1248,44 @@ class TurnController {
     this.pruneTransient()
     this.endReasoningPhase()
 
+    // Close the generation window at the first tool.start (args parsed +
+    // dispatched) and fold it into the pending-shelf accumulator. Duration
+    // is added once per call (guarded by end === null); arg tokens add per
+    // tool so a parallel batch sums its whole generated payload.
+    if (this.toolGenStartMs !== null && this.toolGenEndMs === null) {
+      this.toolGenEndMs = Date.now()
+      this.pendingToolGen.durationMs += this.toolGenEndMs - this.toolGenStartMs
+    }
+
+    if (argsJson) {
+      this.pendingToolGen.tokens += estimateTokensRough(argsJson)
+    }
+
     const sample = `${name} ${context}`.trim()
 
     this.toolTokenAcc += sample ? estimateTokensRough(sample) : 0
     this.activeTools = [...this.activeTools, { context, id: toolId, labels, name, startedAt: Date.now(), verboseArgs }]
 
-    patchTurnState({ toolTokens: this.toolTokenAcc, tools: this.activeTools })
+    patchTurnState({
+      toolTokens: this.toolTokenAcc,
+      tools: this.activeTools,
+      ...this.toolGenFields()
+    })
+  }
+
+  // The accumulated tool-arg generation window, as spreadable Msg fields.
+  // The token count is always included when present; the duration only when
+  // a real generation window was observed (so a missing `tool.generating`
+  // yields a bare count, not a `↓ 0.0s · ~∞ tok/s` rate).
+  private toolGenFields(): Pick<Msg, 'toolGenDurationMs' | 'toolGenTokens'> {
+    if (this.pendingToolGen.tokens <= 0) {
+      return {}
+    }
+
+    return {
+      toolGenTokens: this.pendingToolGen.tokens,
+      ...(this.pendingToolGen.durationMs > 0 ? { toolGenDurationMs: this.pendingToolGen.durationMs } : {})
+    }
   }
 
   reset() {
@@ -930,6 +1303,9 @@ class TurnController {
     this.segmentMessages = []
     this.turnTools = []
     this.toolTokenAcc = 0
+    this.toolGenStartMs = null
+    this.toolGenEndMs = null
+    this.pendingToolGen = { durationMs: 0, tokens: 0 }
     this.persistedToolLabels.clear()
     // Session boundary: drop notice state so session A's sticky can't bleed
     // into session B (R3-H5). reset()/fullReset() CLEAR — they never flush.
@@ -956,6 +1332,21 @@ class TurnController {
     }, STREAM_BATCH_MS)
   }
 
+  // Live timing snapshot for the in-flight text block. decodeMs counts up
+  // from the first text token to the LAST token (not the render moment), so
+  // a gap between the last token and the next event doesn't inflate the live
+  // rate; prefillMs is the (already-consumed) TTFT captured when the block
+  // opened. Patched on each stream batch tick so the rendered duration /
+  // tok/s update in realtime.
+  private liveStreamTiming() {
+    return {
+      ...(this.textPrefillMs !== undefined ? { prefillMs: this.textPrefillMs } : {}),
+      ...(this.textStreamStartMs !== null
+        ? { decodeMs: (this.textLastDeltaMs ?? Date.now()) - this.textStreamStartMs }
+        : {})
+    }
+  }
+
   scheduleStreaming() {
     if (this.streamTimer) {
       return
@@ -965,7 +1356,7 @@ class TurnController {
       this.streamTimer = null
       const raw = this.bufRef.trimStart()
       const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw
-      patchTurnState({ streaming: boundedLiveRenderText(visible) })
+      patchTurnState({ streaming: boundedLiveRenderText(visible), streamTiming: this.liveStreamTiming() })
     }, this.streamDelay)
   }
 
@@ -986,7 +1377,19 @@ class TurnController {
     this.interimBoundaryIndex = null
     this.turnTools = []
     this.toolTokenAcc = 0
+    this.toolGenStartMs = null
+    this.toolGenEndMs = null
+    this.pendingToolGen = { durationMs: 0, tokens: 0 }
     this.interrupted = false
+    this.textPrefillMs = undefined
+
+    // Only arm if the submit path hasn't already — message.start is the
+    // authoritative turn-start for non-submit-triggered turns (auto-continue,
+    // notifications), but a submit-anchored clock is fresher for user turns.
+    if (this.modelCallStartMs === null) {
+      this.armPrefillClock()
+    }
+
     this.persistedToolLabels.clear()
     // "Flash and yield" notices clear when a new turn starts: a usage-band heads-up
     // (credits.usage, 50/75/90%) and the one-time "grant spent" transition

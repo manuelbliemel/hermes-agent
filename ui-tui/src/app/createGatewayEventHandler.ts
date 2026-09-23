@@ -22,7 +22,7 @@ import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
 import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
-import { formatAbandonedClarify, formatAbandonedClarifyBatch, formatToolCall } from '../lib/text.js'
+import { fmtGenDuration, formatAbandonedClarify, formatAbandonedClarifyBatch, formatToolCall } from '../lib/text.js'
 import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/themeBoot.js'
 import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
 import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
@@ -886,7 +886,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           scheduleThinkingStatus(value || statusFromBusy())
 
           if (value) {
-            turnController.recordReasoningDelta(value)
+            // Status text, not a model token — never opens the prefill/decode
+            // clock (see recordReasoningDelta.startsClock).
+            turnController.recordReasoningDelta(value, false, false)
           }
         }
 
@@ -927,12 +929,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (p.kind === 'compressing' || p.kind === 'compacting') {
           sys(p.text)
           turnController.clearStatusTimer()
+          turnController.beginCompaction()
           patchUiState({ compacting: true })
 
           return
         }
 
         if (p.kind === 'compacted') {
+          const ms = turnController.endCompaction()
+
+          if (ms !== null) {
+            sys(`🗜️ Context compaction · ${fmtGenDuration(ms)}`)
+          }
+
           patchUiState({ compacting: false })
         }
 
@@ -1246,6 +1255,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'tool.generating':
         if (ev.payload?.name) {
+          turnController.recordToolGenerating()
           turnController.pushTrail(`drafting ${ev.payload.name}…`)
         }
 
@@ -1269,7 +1279,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           ev.payload.name ?? 'tool',
           ev.payload.context ?? '',
           ev.payload.args_text ? stripAnsi(String(ev.payload.args_text)) : undefined,
-          ev.payload.labels ?? undefined
+          ev.payload.labels ?? undefined,
+          ev.payload.args ? JSON.stringify(ev.payload.args) : undefined
         )
 
         return
@@ -1298,7 +1309,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.name,
             ev.payload.duration_s ?? undefined,
             resultText,
-            ev.payload.labels ?? undefined
+            ev.payload.labels ?? undefined,
+            ev.payload.last_call?.new ?? undefined
           )
         } else {
           turnController.recordToolComplete(
@@ -1308,7 +1320,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.duration_s ?? undefined,
             ev.payload.todos ?? undefined,
             resultText,
-            ev.payload.labels ?? undefined
+            ev.payload.labels ?? undefined,
+            ev.payload.last_call?.new ?? undefined
           )
         }
 

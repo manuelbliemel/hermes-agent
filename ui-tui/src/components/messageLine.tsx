@@ -1,5 +1,6 @@
 import { Ansi, Box, NoSelect, Text } from '@hermes/ink'
 import { hasAnsi, sanitizeAnsiForRender, stripAnsi } from '@hermes/shared/ansi'
+import { compactNumber } from '@hermes/shared/format'
 import { memo, useState } from 'react'
 
 import { TERMUX_TUI_MODE } from '../config/env.js'
@@ -10,7 +11,7 @@ import { sectionMode } from '../domain/details.js'
 import { userDisplay } from '../domain/messages.js'
 import { ROLE } from '../domain/roles.js'
 import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
-import { boundedLiveRenderText, compactPreview, isPasteBackedText } from '../lib/text.js'
+import { boundedLiveRenderText, compactPreview, estimateTokensRough, fmtDecode, fmtPrefill, isPasteBackedText } from '../lib/text.js'
 import type { Theme } from '../theme.js'
 import type { ActiveTool, DetailsMode, Msg, SectionVisibility } from '../types.js'
 
@@ -49,6 +50,8 @@ export const MessageLine = memo(function MessageLine({
   detailsModeCommandOverride = false,
   isStreaming = false,
   liveDetails = false,
+  livePrefillStartMs,
+  generationTiming = false,
   msg,
   prev,
   reasoningActive = false,
@@ -98,6 +101,8 @@ export const MessageLine = memo(function MessageLine({
         <ToolTrail
           commandOverride={detailsModeCommandOverride}
           detailsMode={detailsMode}
+          generationTiming={generationTiming}
+          livePrefillStartMs={livePrefillStartMs}
           preferExpandedThinking={liveDetails}
           reasoning={thinking}
           reasoningActive={reasoningActive}
@@ -105,6 +110,11 @@ export const MessageLine = memo(function MessageLine({
           reasoningTokens={msg.thinkingTokens}
           sections={sections}
           t={t}
+          thinkingDurationMs={msg.thinkingDurationMs}
+          thinkingPrefillMs={msg.thinkingPrefillMs}
+          thinkingPrefillNewTokens={msg.thinkingPrefillNewTokens}
+          toolGenDurationMs={msg.toolGenDurationMs}
+          toolGenTokens={msg.toolGenTokens}
           tools={tools}
           toolTokens={msg.toolTokens}
           trail={msg.tools ?? []}
@@ -259,6 +269,29 @@ export const MessageLine = memo(function MessageLine({
   const stamp =
     timestamps && (msg.role === 'user' || msg.role === 'assistant') && !msg.kind ? fmtMsgTimestamp(msg.createdAt) : null
 
+  // Generation time + rough throughput for the assistant reply, mirroring
+  // the tool trail's "(1.5s)". Rides the "Response" separator when present,
+  // otherwise gets its own dim row next to the timestamp stamp. The live
+  // token estimate rides along too (same shape as the Thinking header), so
+  // the count ticks up while the block streams; gated on timing presence so
+  // rehydrated transcripts (no live clocks) stay as they were.
+  const responseTokens = msg.role === 'assistant' && msg.text ? estimateTokensRough(msg.text) : 0
+
+  const responseMeta =
+    generationTiming && msg.role === 'assistant' && (msg.textDurationMs !== undefined || msg.textPrefillMs !== undefined)
+      ? [
+          responseTokens > 0 ? `~${compactNumber(responseTokens)} tokens` : null,
+          fmtPrefill(msg.textPrefillMs, msg.textPrefillNewTokens),
+          fmtDecode(msg.textDurationMs, responseTokens)
+        ]
+          .filter(Boolean)
+          .join(' · ') || null
+      : null
+
+  // Without the separator there's nowhere else to put the meta — fold it
+  // into the stamp row (or render the meta alone when timestamps are off).
+  const metaRow = showResponseSeparator ? stamp : ([stamp, responseMeta].filter(Boolean).join(' · ') || null)
+
   return (
     <Box
       flexDirection="column"
@@ -270,12 +303,18 @@ export const MessageLine = memo(function MessageLine({
           <ToolTrail
             commandOverride={detailsModeCommandOverride}
             detailsMode={detailsMode}
+            generationTiming={generationTiming}
             preferExpandedThinking={liveDetails}
             reasoning={thinking}
             reasoningActive={reasoningActive}
             reasoningTokens={msg.thinkingTokens}
             sections={sections}
             t={t}
+            thinkingDurationMs={msg.thinkingDurationMs}
+            thinkingPrefillMs={msg.thinkingPrefillMs}
+            thinkingPrefillNewTokens={msg.thinkingPrefillNewTokens}
+            toolGenDurationMs={msg.toolGenDurationMs}
+            toolGenTokens={msg.toolGenTokens}
             toolTokens={msg.toolTokens}
             trail={msg.tools}
           />
@@ -288,18 +327,18 @@ export const MessageLine = memo(function MessageLine({
             <Text color={t.color.border}>└─ </Text>
           </NoSelect>
           <Text color={t.color.muted} dim>
-            Response
+            Response{responseMeta ? ` · ${responseMeta}` : ''}
           </Text>
         </Box>
       )}
 
-      {stamp && (
+      {metaRow && (
         <Box>
           <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
             <Text> </Text>
           </NoSelect>
           <Text color={t.color.muted} dim>
-            {stamp}
+            {metaRow}
           </Text>
         </Box>
       )}
@@ -339,6 +378,12 @@ interface MessageLineProps {
   detailsModeCommandOverride?: boolean
   isStreaming?: boolean
   liveDetails?: boolean
+  // Live ↑ prefill clock start, passed only for the live thinking block
+  // while the clock is armed (see ToolTrail.livePrefillStartMs).
+  livePrefillStartMs?: number
+  // `display.generation_timing` — master switch for timing-derived output
+  // (response prefill/decode meta, forwarded to ToolTrail).
+  generationTiming?: boolean
   msg: Msg
   // The block rendered directly above this one. Drives the group-boundary
   // lead gap (see domain/blockLayout.ts::hasLeadGap). Undefined at the top of

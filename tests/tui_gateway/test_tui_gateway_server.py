@@ -19542,6 +19542,43 @@ def test_get_usage_perf_readouts_omitted_without_data():
     assert "avg_tps" not in usage
 
 
+def test_get_usage_last_call_prefill_split():
+    """last_call carries the LAST API call's prompt/cache split so the TUI can
+    show real prefill tokens (prompt - cache_read) against the client-measured
+    TTFT. Sourced from agent._last_turn_usage (agent/turn_usage.py)."""
+
+    class _WarmAgent:
+        model = "x"
+        _last_turn_usage = {
+            "prompt_tokens": 30_000,
+            "completion_tokens": 500,
+            "cache_read_tokens": 17_000,
+            "cache_write_tokens": 0,
+        }
+
+    usage = server._get_usage(_WarmAgent())
+    assert usage["last_call"] == {"prompt": 30_000, "cache_read": 17_000, "new": 13_000}
+
+
+def test_get_usage_last_call_fully_cached_and_missing():
+    """A fully-cached call reports new=0; no usage at all omits the key."""
+
+    class _FullyCachedAgent:
+        model = "x"
+        _last_turn_usage = {"prompt_tokens": 20_000, "cache_read_tokens": 20_000}
+
+    assert server._get_usage(_FullyCachedAgent())["last_call"] == {
+        "prompt": 20_000,
+        "cache_read": 20_000,
+        "new": 0,
+    }
+
+    class _UsagelessAgent:
+        model = "x"
+
+    assert "last_call" not in server._get_usage(_UsagelessAgent())
+
+
 def test_get_usage_perf_readouts_guard_negative_latency():
     """Odd provider timings (negative durations seen in logs) are dropped."""
     from collections import deque

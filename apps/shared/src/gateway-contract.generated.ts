@@ -579,6 +579,14 @@ export interface Usage {
   dev_credits_spent_micros?: number | null
   cost_usd?: number | null
   cost_status?: string | null
+  last_call?: LastCallUsage | null
+  [key: string]: unknown
+}
+/** The most recent API call's prompt accounting (``agent._last_turn_usage``): how much of the prompt the server actually prefilled vs served from cache. ``new`` = prompt - cache_read (cache writes still pay full prefill). */
+export interface LastCallUsage {
+  prompt?: number
+  cache_read?: number
+  new?: number
   [key: string]: unknown
 }
 export interface McpServerStatus {
@@ -3129,6 +3137,7 @@ export interface SessionUsageResult {
   dev_credits_spent_micros?: number | null
   cost_usd?: number | null
   cost_status?: string | null
+  last_call?: LastCallUsage | null
   credits_lines?: string[] | null
   [key: string]: unknown
 }
@@ -4402,7 +4411,7 @@ export interface ToolStartPayload {
   preview?: string | null
   labels?: ToolLabel[] | null
 }
-/** ``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools. */
+/** ``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools. ``last_call`` is the model call that produced this tool's settled prefill split — the boundary where the TUI stamps the preceding blocks without waiting for turn end. */
 export interface ToolCompletePayload {
   tool_id: string
   name: string
@@ -4415,6 +4424,7 @@ export interface ToolCompletePayload {
   todos?: unknown[] | null
   revision?: number | null
   labels?: ToolLabel[] | null
+  last_call?: LastCallUsage | null
 }
 /** ``agent_callbacks`` tool_gen_callback. */
 export interface ToolGeneratingPayload {

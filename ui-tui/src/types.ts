@@ -156,6 +156,29 @@ export interface Msg {
   isLiveReasoning?: boolean
   thinkingTokens?: number
   toolTokens?: number
+  // Wall-clock ms the model spent generating this call's tool-argument JSON
+  // (first `tool.generating` → first `tool.start`), and the rough token
+  // count of those args. Rendered as a decode rate on the "Tool calls"
+  // group header so tool-call generation is visible without polluting the
+  // thinking/prose blocks' own rates.
+  toolGenDurationMs?: number
+  toolGenTokens?: number
+  // Wall-clock ms the model spent generating this block's reasoning / text,
+  // measured live in turnController (first delta → seal). Drives the
+  // "~N tokens · Xs · ~R tok/s" labels on the Thinking panel and the
+  // assistant response row; absent on rehydrated transcripts.
+  thinkingDurationMs?: number
+  textDurationMs?: number
+  // Time-to-first-token (model-call start → first delta of this block),
+  // rendered as "↑ Xs prefill" next to the decode stats. Only the block
+  // that starts streaming after a model call carries it.
+  thinkingPrefillMs?: number
+  textPrefillMs?: number
+  // Cache-miss prompt tokens for the model call whose prefill this block
+  // waited on (usage.last_call.new, reported by the server). Enables the
+  // "N new · R tok/s" prefill rate; absent when the server omitted usage.
+  thinkingPrefillNewTokens?: number
+  textPrefillNewTokens?: number
   tools?: string[]
   todos?: TodoItem[]
   todoIncomplete?: boolean

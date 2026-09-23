@@ -80,6 +80,9 @@ export interface ConfigDisplayConfig {
   details_mode?: string
   /** Focus view (/focus) — display-only reduced-output mode. */
   focus_view?: boolean
+  /** TUI generation timing (↑ prefill / ↓ decode clocks, tok/s rates, live
+   *  prefill + compaction tickers). Opt-in; default off. */
+  generation_timing?: boolean
   inline_diffs?: boolean
   mouse_tracking?: boolean | null | number | string
   sections?: Record<string, string>

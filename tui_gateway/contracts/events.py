@@ -18,7 +18,7 @@ from __future__ import annotations
 from pydantic import Field
 
 from .base import JsonValue, Payload, WireEnum
-from .common import MessageReaction, SessionLiveInfo, SubagentStatus, ToolLabel, ToolLabelKind, Usage
+from .common import LastCallUsage, MessageReaction, SessionLiveInfo, SubagentStatus, ToolLabel, ToolLabelKind, Usage
 from .config_free_tier_control import SessionControlSnapshot
 from .registry import event
 
@@ -272,7 +272,9 @@ event("tool.start", ToolStartPayload, doc="A tool call began (stable id + full a
 
 
 class ToolCompletePayload(Payload):
-    """``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools."""
+    """``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools.
+    ``last_call`` is the model call that produced this tool's settled prefill split — the
+    boundary where the TUI stamps the preceding blocks without waiting for turn end."""
 
     tool_id: str
     name: str
@@ -285,6 +287,7 @@ class ToolCompletePayload(Payload):
     todos: list[JsonValue] | None = None
     revision: int | None = None
     labels: list[ToolLabel] | None = None
+    last_call: LastCallUsage | None = None
 
 
 event("tool.complete", ToolCompletePayload, doc="A tool call finished: parsed result, summary, optional diff / todo snapshot.")

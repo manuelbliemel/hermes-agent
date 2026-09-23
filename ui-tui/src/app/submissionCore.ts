@@ -78,6 +78,10 @@ export function submitPrompt(
     patchUiState({ busy: true, status: 'running…' })
     turnController.bufRef = ''
     turnController.interrupted = false
+    // Anchor the prefill (time-to-first-token) clock at the user's actual
+    // "I want output now" moment. The gateway's message.start can arrive
+    // too close to the first delta to capture the prefill wait on its own.
+    turnController.armPrefillClock()
 
     deps.gw
       .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })

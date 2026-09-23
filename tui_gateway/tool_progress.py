@@ -3,6 +3,8 @@ projection. Bodies are rebound onto server.py's globals (method_ctx.bind_module)
 
 from __future__ import annotations
 
+import contextlib
+
 from .method_ctx import bind_module
 
 # Verbose tool text is capped to the Ink render budget (a hair more, so the "[omitted …]" label
@@ -279,6 +281,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
+    # The model call that produced this tool has settled (turn_usage folded its
+    # usage before execution): ship the prefill split so the TUI stamps the
+    # blocks that waited on it NOW instead of at turn end.
+    if session is not None:
+        with contextlib.suppress(Exception):
+            from agent.turn_usage import last_call_prefill_split
+            if (split := last_call_prefill_split(session.get("agent"))) is not None:
+                payload["last_call"] = split
     if _session_verbose(sid) and (result_text := _tool_result_text(result)):
         payload["result_text"] = result_text
     todo_state = _normalize_todo_state(payload.get("result")) if name in _TODO_TOOL_NAMES else None

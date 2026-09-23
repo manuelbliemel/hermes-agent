@@ -2006,6 +2006,15 @@ def _get_usage(agent) -> dict:
         _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
         if _prompt_total > 0 and _cache_read > 0:
             usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+    # Per-call prompt accounting from the LAST API call: how much of the prompt
+    # the server actually prefilled vs served from its KV cache. The TUI pairs
+    # this with the client-measured prefill (TTFT) duration to show real
+    # prefill throughput.
+    with contextlib.suppress(Exception):
+        from agent.turn_usage import last_call_prefill_split
+        _split = last_call_prefill_split(agent)
+        if _split is not None:
+            usage["last_call"] = _split
     with contextlib.suppress(Exception):  # a status-bar readout must never break usage reporting
         _lhist = list(getattr(agent, "_api_latency_history", []) or [])
         _ohist = list(getattr(agent, "_api_output_history", []) or [])
