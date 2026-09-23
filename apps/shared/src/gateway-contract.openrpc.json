@@ -15710,6 +15710,29 @@
         "title": "InterruptStatus",
         "type": "string"
       },
+      "LastCallUsage": {
+        "additionalProperties": true,
+        "description": "The most recent API call's prompt accounting (``agent._last_turn_usage``):\nhow much of the prompt the server actually prefilled vs served from cache.\n``new`` = prompt - cache_read (cache writes still pay full prefill).",
+        "properties": {
+          "prompt": {
+            "default": 0,
+            "title": "Prompt",
+            "type": "integer"
+          },
+          "cache_read": {
+            "default": 0,
+            "title": "Cache Read",
+            "type": "integer"
+          },
+          "new": {
+            "default": 0,
+            "title": "New",
+            "type": "integer"
+          }
+        },
+        "title": "LastCallUsage",
+        "type": "object"
+      },
       "LayoutApplyPayload": {
         "additionalProperties": true,
         "description": "``tools/apply_layout_tool.py``.",
@@ -30713,6 +30736,17 @@
             "default": null,
             "title": "Cost Status"
           },
+          "last_call": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LastCallUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "credits_lines": {
             "anyOf": [
               {
@@ -33895,7 +33929,7 @@
       },
       "ToolCompletePayload": {
         "additionalProperties": false,
-        "description": "``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools.",
+        "description": "``tool_progress._on_tool_complete``; ``todos``/``revision`` merged in for the todo tools.\n``last_call`` is the model call that produced this tool's settled prefill split \u2014 the\nboundary where the TUI stamps the preceding blocks without waiting for turn end.",
         "properties": {
           "tool_id": {
             "title": "Tool Id",
@@ -34009,6 +34043,17 @@
             ],
             "default": null,
             "title": "Labels"
+          },
+          "last_call": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LastCallUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -35056,6 +35101,17 @@
             ],
             "default": null,
             "title": "Cost Status"
+          },
+          "last_call": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LastCallUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "title": "Usage",

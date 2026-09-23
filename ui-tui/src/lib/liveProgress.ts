@@ -14,7 +14,16 @@ export const canHoldToolShelf = (msg: Msg | undefined) =>
 
 export const mergeToolShelfInto = (target: Msg, source: Msg): Msg => ({
   ...target,
-  tools: [...(target.tools ?? []), ...(source.tools ?? [])]
+  tools: [...(target.tools ?? []), ...(source.tools ?? [])],
+  // Tool-arg generation windows are per-call; a shelf that accumulates
+  // tools across several calls sums their generation time and tokens so
+  // the header rate reflects the whole segment's tool generation.
+  ...(source.toolGenDurationMs !== undefined || source.toolGenTokens !== undefined
+    ? {
+        toolGenDurationMs: (target.toolGenDurationMs ?? 0) + (source.toolGenDurationMs ?? 0),
+        toolGenTokens: (target.toolGenTokens ?? 0) + (source.toolGenTokens ?? 0)
+      }
+    : {})
 })
 
 const isBarrierMessage = (msg: Msg | undefined) => {

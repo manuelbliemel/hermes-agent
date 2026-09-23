@@ -366,6 +366,9 @@ export interface UiState {
   // `display.timestamps` — dim [HH:MM] labels on user/assistant transcript
   // rows, the same config key the classic CLI honors (#41531).
   timestamps: boolean
+  // `display.generation_timing` — ↑ prefill / ↓ decode clocks, tok/s rates
+  // and the live prefill/compaction tickers. Opt-in; off hides all of them.
+  generationTiming: boolean
   usage: Usage
 }
 

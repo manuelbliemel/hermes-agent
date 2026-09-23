@@ -2173,6 +2173,7 @@ display:
   vim_mode: false         # CLI only: vi/vim keybindings in the input composer (Esc → NORMAL, i → INSERT). The live NORMAL/INSERT/REPLACE mode shows at the right of the status bar. Config-only, read at startup.
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)
+  generation_timing: false # TUI only: per-block generation clocks — ↑ prefill (time-to-first-token, with cache-miss token count and rate when the server reports prompt accounting) and ↓ decode duration with tok/s throughput on thinking, response, and tool-argument headers, plus live prefill and context-compaction tickers (default: false)
   tool_preview_length: 0  # Max chars for tool call previews (0 = no limit, show full paths/commands)
   turn_summary: true      # CLI only: print a one-line post-turn accounting footer after each interactive turn
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer

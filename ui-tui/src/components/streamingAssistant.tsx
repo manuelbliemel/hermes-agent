@@ -5,10 +5,12 @@ import type { AppLayoutProgressProps } from '../app/interfaces.js'
 import { toggleTodoCollapsed, useTurnSelector } from '../app/turnStore.js'
 import { $uiState } from '../app/uiStore.js'
 import { blockRenders } from '../domain/blockLayout.js'
+import { sectionMode } from '../domain/details.js'
 import { appendToolShelfMessage } from '../lib/liveProgress.js'
 import type { ActiveTool, DetailsMode, Msg, SectionVisibility } from '../types.js'
 
 import { MessageLine } from './messageLine.js'
+import { LiveCompactionLine, LivePrefillLine } from './thinking.js'
 import { TodoPanel } from './todoPanel.js'
 
 const groupedSegments = (segments: Msg[]): Msg[] =>
@@ -31,13 +33,38 @@ export const StreamingAssistant = memo(function StreamingAssistant({
   sections
 }: StreamingAssistantProps) {
   const ui = useStore($uiState)
+  const generationTiming = ui.generationTiming
   const streamSegments = useTurnSelector(state => state.streamSegments)
   const streamPendingTools = useTurnSelector(state => state.streamPendingTools)
+  const streamTiming = useTurnSelector(state => state.streamTiming)
   const streaming = useTurnSelector(state => state.streaming)
   const activeTools = useTurnSelector(state => state.tools)
+  const toolGenDurationMs = useTurnSelector(state => state.toolGenDurationMs)
+  const toolGenTokens = useTurnSelector(state => state.toolGenTokens)
+  const prefillStartMs = useTurnSelector(state => state.prefillStartMs)
+  const compactionStartMs = useTurnSelector(state => state.compactionStartMs)
   const showStreamingArea = Boolean(streaming)
+  // Live ↑ ticker for the whole prefill phase: shown whenever the clock is
+  // armed (submitted / tool result sent, no real token yet) and unmounts the
+  // instant the first token consumes it. NOT gated on "no segments" — the
+  // thinking.delta status text creates a segment right after submit, so the
+  // ticker must stay up as long as the prefill clock is armed. Gated on
+  // `display.generation_timing` — with the flag off the clocks never show.
+  const showPrefillTicker = generationTiming && prefillStartMs !== null
+  // Live compaction line: shown while a context summarization is in
+  // progress. The prefill clock is paused during compaction (prefillStartMs
+  // is null), so it never competes with the ↑ ticker.
+  const showCompactionLine = generationTiming && compactionStartMs !== null
+  // When a live reasoning segment exists AND its header will actually paint,
+  // the thinking header hosts the ↑ prefill clock itself (live during
+  // prefill, frozen once the first token lands), so the separate bottom
+  // ticker would be a duplicate "Thinking" label in a second place.
+  // Suppress it in that case; keep it as the fallback when there's no
+  // thinking header to host the clock (e.g. thinking hidden via /details).
+  const visibleThinking = sectionMode('thinking', detailsMode, sections, detailsModeCommandOverride) !== 'hidden'
+  const hasLiveThinking = visibleThinking && streamSegments.some(msg => msg.isLiveReasoning === true)
 
-  if (!progress.showProgressArea && !showStreamingArea && !activeTools.length) {
+  if (!progress.showProgressArea && !showStreamingArea && !activeTools.length && !showPrefillTicker && !showCompactionLine) {
     return null
   }
 
@@ -49,14 +76,30 @@ export const StreamingAssistant = memo(function StreamingAssistant({
   const blocks: LiveBlock[] = groupedSegments(streamSegments).map((msg, i) => ({ key: `seg:${i}`, msg }))
 
   if (activeTools.length) {
-    blocks.push({ key: 'active-tools', msg: { kind: 'trail', role: 'system', text: '' }, tools: activeTools })
+    blocks.push({
+      key: 'active-tools',
+      msg: {
+        kind: 'trail',
+        role: 'system',
+        text: '',
+        ...(toolGenDurationMs !== null ? { toolGenDurationMs } : {}),
+        ...(toolGenTokens > 0 ? { toolGenTokens } : {})
+      },
+      tools: activeTools
+    })
   }
 
   if (showStreamingArea) {
     blocks.push({
       isStreaming: true,
       key: 'streaming',
-      msg: { role: 'assistant', text: streaming, ...(streamPendingTools.length && { tools: streamPendingTools }) }
+      msg: {
+        role: 'assistant',
+        text: streaming,
+        ...(streamTiming?.prefillMs !== undefined && { textPrefillMs: streamTiming.prefillMs }),
+        ...(streamTiming?.decodeMs !== undefined && { textDurationMs: streamTiming.decodeMs }),
+        ...(streamPendingTools.length && { tools: streamPendingTools })
+      }
     })
   } else if (streamPendingTools.length) {
     blocks.push({ key: 'pending-tools', msg: { kind: 'trail', role: 'system', text: '', tools: streamPendingTools } })
@@ -74,9 +117,13 @@ export const StreamingAssistant = memo(function StreamingAssistant({
             compact={compact}
             detailsMode={detailsMode}
             detailsModeCommandOverride={detailsModeCommandOverride}
+            generationTiming={generationTiming}
             isStreaming={block.isStreaming}
             key={block.key}
             liveDetails
+            {...(block.msg.isLiveReasoning === true && prefillStartMs !== null
+              ? { livePrefillStartMs: prefillStartMs }
+              : {})}
             msg={block.msg}
             prev={prev}
             reasoningActive={block.msg.isLiveReasoning === true}
@@ -97,6 +144,14 @@ export const StreamingAssistant = memo(function StreamingAssistant({
 
         return node
       })}
+
+      {showCompactionLine && compactionStartMs !== null ? (
+        <LiveCompactionLine startMs={compactionStartMs} t={ui.theme} />
+      ) : null}
+
+      {showPrefillTicker && prefillStartMs !== null && !hasLiveThinking ? (
+        <LivePrefillLine startMs={prefillStartMs} t={ui.theme} />
+      ) : null}
     </>
   )
 })

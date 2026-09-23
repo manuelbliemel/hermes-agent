@@ -70,6 +70,21 @@ def _fold_moa_usage(agent, canonical_usage):
     return _moa_client, canonical_usage, _moa_ref_cost
 
 
+def last_call_prefill_split(agent: Any) -> Dict[str, int] | None:
+    """``{prompt, cache_read, new}`` for the agent's LAST completed API call, or
+    None when no usage was reported. ``new`` = prompt - cache_read: the tokens
+    that actually ran through prefill. Read by the TUI gateway (usage payload +
+    per-tool boundary) to pair the client-measured TTFT with real token counts."""
+    last = getattr(agent, "_last_turn_usage", None)
+    if not isinstance(last, dict):
+        return None
+    prompt = int(last.get("prompt_tokens") or 0)
+    if prompt <= 0:
+        return None
+    cache_read = int(last.get("cache_read_tokens") or 0)
+    return {"prompt": prompt, "cache_read": cache_read, "new": max(0, prompt - cache_read)}
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: List[Dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,

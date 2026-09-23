@@ -420,6 +420,62 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual([])
   })
 
+  it('stamps the tool-arg generation window on the tool shelf', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      // Model starts emitting the tool-call JSON, spends 2s generating the
+      // args, then the tool dispatches. The shelf must carry that window.
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { name: 'write_file' }, type: 'tool.generating' } as any)
+      vi.advanceTimersByTime(2_000)
+      onEvent({
+        payload: {
+          context: 'a file',
+          name: 'write_file',
+          tool_id: 'w1',
+          args: { path: '/tmp/x', content: 'hello world this is the file body' }
+        },
+        type: 'tool.start'
+      } as any)
+      onEvent({ payload: { summary: 'done', tool_id: 'w1' }, type: 'tool.complete' } as any)
+      onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+
+      const trail = appended.find(msg => msg.kind === 'trail')
+      expect(trail?.toolGenDurationMs).toBe(2_000)
+      expect(trail?.toolGenTokens).toBeGreaterThan(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('shows the generated-args token count even without a tool.generating event', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    // No tool.generating (e.g. a provider path that doesn't fire it): the
+    // token count must still be present; only the duration is unavailable.
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({
+      payload: {
+        context: 'a file',
+        name: 'write_file',
+        tool_id: 'w1',
+        args: { path: '/tmp/x', content: 'hello world this is the file body' }
+      },
+      type: 'tool.start'
+    } as any)
+    onEvent({ payload: { summary: 'done', tool_id: 'w1' }, type: 'tool.complete' } as any)
+    onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+
+    const trail = appended.find(msg => msg.kind === 'trail')
+    expect(trail?.toolGenTokens).toBeGreaterThan(0)
+    expect(trail?.toolGenDurationMs).toBeUndefined()
+  })
+
   it('persists completed tool rows when message.complete lands immediately after tool.complete', () => {
     const appended: Msg[] = []
 
@@ -588,6 +644,389 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
+  it('stamps thinking and response blocks with generation durations', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { text: 'pondering the plan' }, type: 'reasoning.delta' } as any)
+    onEvent({ payload: { text: 'the final answer text' }, type: 'message.delta' } as any)
+    onEvent({ payload: { text: 'the final answer text' }, type: 'message.complete' } as any)
+
+    const trail = appended.find(msg => msg.thinking)
+    const final = appended[appended.length - 1]
+
+    expect(trail?.thinkingDurationMs).toEqual(expect.any(Number))
+    expect(final?.role).toBe('assistant')
+    expect(final?.textDurationMs).toEqual(expect.any(Number))
+  })
+
+  it('does not charge the thinking block for tool-call JSON generation time', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      // The screenshot case: reasoning streams for 1s, then the model spends
+      // 7.5s generating the tool-call JSON before `tool.start` fires. The
+      // thinking block's window must end at its LAST reasoning token, so the
+      // sealed duration is ~1s — not the 8.5s until tool.start.
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { text: 'I will rewrite the file' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(1_000)
+      onEvent({ payload: { text: ' now.' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(7_500)
+      onEvent({ payload: { context: 'x', name: 'write_file', tool_id: 'w1' }, type: 'tool.start' } as any)
+
+      const liveThinking = turnController.segmentMessages.find(msg => msg.thinking)
+      expect(liveThinking?.thinkingDurationMs).toBe(1_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('freezes the thinking duration once the text stream starts (no overlap)', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      // Thinking runs for 3s: first token at t=0, last token at t=3000.
+      onEvent({ payload: { text: 'pondering' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(3_000)
+
+      // Text stream starts — this must freeze the thinking clock at 3s.
+      onEvent({ payload: { text: '...' }, type: 'reasoning.delta' } as any)
+      onEvent({ payload: { text: 'answer ' }, type: 'message.delta' } as any)
+      vi.advanceTimersByTime(5_000)
+      onEvent({ payload: { text: 'continues' }, type: 'message.delta' } as any)
+
+      const liveThinking = turnController.segmentMessages.find(msg => msg.thinking)
+      expect(liveThinking?.thinkingDurationMs).toBe(3_000)
+
+      onEvent({ payload: { text: 'answer continues' }, type: 'message.complete' } as any)
+
+      const trail = appended.find(msg => msg.thinking)
+      expect(trail?.thinkingDurationMs).toBe(3_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('attributes prefill (time-to-first-token) to the block that streams first', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      // Turn starts; 1.5s of prefill elapses before the first reasoning token.
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(1_500)
+      onEvent({ payload: { text: 'thinking hard' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(2_000)
+      onEvent({ payload: { text: '...' }, type: 'reasoning.delta' } as any)
+      onEvent({ payload: { text: 'the answer' }, type: 'message.delta' } as any)
+      onEvent({ payload: { text: 'the answer' }, type: 'message.complete' } as any)
+
+      const trail = appended.find(msg => msg.thinking)
+      const final = appended[appended.length - 1]
+
+      // Prefill was consumed by the reasoning block; the text block that
+      // followed in the SAME model call has no prefill of its own.
+      expect(trail?.thinkingPrefillMs).toBe(1_500)
+      expect(trail?.thinkingDurationMs).toBe(2_000)
+      expect(final?.textPrefillMs).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('attributes prefill to the text block when no reasoning streams', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(900)
+      onEvent({ payload: { text: 'plain answer' }, type: 'message.delta' } as any)
+      onEvent({ payload: { text: 'plain answer' }, type: 'message.complete' } as any)
+
+      const final = appended[appended.length - 1]
+      expect(final?.role).toBe('assistant')
+      expect(final?.textPrefillMs).toBe(900)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not let the legacy thinking.delta status text steal the prefill', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      // The agent fires a spinner status ("◉ pondering...") right before the
+      // API call. It is not a model token — it must NOT consume the prefill
+      // clock or open the decode clock.
+      onEvent({ payload: { text: '◉ pondering...' }, type: 'thinking.delta' } as any)
+      expect(getTurnState().prefillStartMs).toBeTypeOf('number')
+
+      // 9s of real prefill on the server, then the first actual token.
+      vi.advanceTimersByTime(9_000)
+      onEvent({ payload: { text: 'real reasoning' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(1_000)
+      onEvent({ payload: { text: '...' }, type: 'reasoning.delta' } as any)
+      onEvent({ payload: { text: 'answer' }, type: 'message.delta' } as any)
+      onEvent({ payload: { text: 'answer' }, type: 'message.complete' } as any)
+
+      const trail = appended.find(msg => msg.thinking)
+      expect(trail?.thinkingPrefillMs).toBe(9_000)
+      expect(trail?.thinkingDurationMs).toBe(1_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not charge the next block for context-compaction wait time', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const ctx = buildCtx(appended)
+      const onEvent = createGatewayEventHandler(ctx)
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      expect(getTurnState().prefillStartMs).toBeTypeOf('number')
+
+      // Preflight compaction starts: the prefill clock is parked so the
+      // summarization's wall-clock is not charged to the next block.
+      onEvent({ payload: { kind: 'compacting', text: 'compacting…' }, type: 'status.update' } as any)
+      expect(getTurnState().prefillStartMs).toBeNull()
+      expect(getTurnState().compactionStartMs).toBeTypeOf('number')
+
+      // 5s of compaction (auxiliary call), then it finishes.
+      vi.advanceTimersByTime(5_000)
+      onEvent({ payload: { kind: 'compacted', text: 'done' }, type: 'status.update' } as any)
+      expect(getTurnState().compactionStartMs).toBeNull()
+      // The compaction is surfaced as its own timed transcript line.
+      expect(ctx.system.sys).toHaveBeenCalledWith(expect.stringContaining('Context compaction'))
+      expect(ctx.system.sys).toHaveBeenCalledWith(expect.stringContaining('5.0s'))
+      // The prefill clock is re-armed for the real call.
+      expect(getTurnState().prefillStartMs).toBeTypeOf('number')
+
+      // 2s of REAL prefill, then the first token.
+      vi.advanceTimersByTime(2_000)
+      onEvent({ payload: { text: 'reasoning after compaction' }, type: 'reasoning.delta' } as any)
+      onEvent({ payload: { text: 'answer' }, type: 'message.delta' } as any)
+      onEvent({ payload: { text: 'answer' }, type: 'message.complete' } as any)
+
+      const trail = appended.find(msg => msg.thinking)
+      // 2s, NOT 7s — the 5s compaction wait is excluded.
+      expect(trail?.thinkingPrefillMs).toBe(2_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-arms the prefill clock after a tool completes (next model call)', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { text: 'using a tool' }, type: 'message.delta' } as any)
+      onEvent({ payload: { context: 'foo', name: 'patch', tool_id: 't1' }, type: 'tool.start' } as any)
+      onEvent({ payload: { summary: 'done', tool_id: 't1' }, type: 'tool.complete' } as any)
+
+      // The tool result goes back to the model; 800ms of prefill before the
+      // next block streams.
+      vi.advanceTimersByTime(800)
+      onEvent({ payload: { text: 'after the tool' }, type: 'message.delta' } as any)
+      onEvent({ payload: { text: 'after the tool' }, type: 'message.complete' } as any)
+
+      const final = appended[appended.length - 1]
+      expect(final?.textPrefillMs).toBe(800)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stamps the server-reported new-token count on the text block that waited for it', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(2_000)
+      onEvent({ payload: { text: 'cold answer' }, type: 'message.delta' } as any)
+      onEvent({
+        payload: { text: 'cold answer', usage: { last_call: { prompt: 30_000, cache_read: 17_000, new: 13_000 } } },
+        type: 'message.complete'
+      } as any)
+
+      const final = appended[appended.length - 1]
+      expect(final?.textPrefillMs).toBe(2_000)
+      expect(final?.textPrefillNewTokens).toBe(13_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stamps the reasoning block (sealed in segments) when it consumed the last prefill', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(1_500)
+      onEvent({ payload: { text: 'thinking hard' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(2_000)
+      onEvent({ payload: { text: 'the answer' }, type: 'message.delta' } as any)
+      onEvent({
+        payload: { text: 'the answer', usage: { last_call: { prompt: 20_000, cache_read: 19_500, new: 500 } } },
+        type: 'message.complete'
+      } as any)
+
+      const trail = appended.find(msg => msg.thinking)
+      const final = appended[appended.length - 1]
+
+      // The reasoning block consumed the call's prefill → it carries the
+      // new-token count; the text block (same call, no own prefill) does not.
+      expect(trail?.thinkingPrefillMs).toBe(1_500)
+      expect(trail?.thinkingPrefillNewTokens).toBe(500)
+      expect(final?.textPrefillNewTokens).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stamps the first blocks at the tool.complete boundary, not turn end', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      // Call 1: reasoning streams, then a tool call.
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(1_500)
+      onEvent({ payload: { text: 'first reasoning' }, type: 'reasoning.delta' } as any)
+      vi.advanceTimersByTime(1_000)
+      onEvent({ payload: { context: 'ls', name: 'terminal', tool_id: 't1' }, type: 'tool.start' } as any)
+
+      // Call 1's usage settled with the tool: the reasoning block that
+      // waited on its prefill gets stamped NOW — before message.complete.
+      onEvent({ payload: { summary: 'done', tool_id: 't1', last_call: { prompt: 9_000, cache_read: 4_000, new: 5_000 } }, type: 'tool.complete' } as any)
+
+      const firstTrail = turnController.segmentMessages.find(msg => msg.thinking)
+      expect(firstTrail?.thinkingPrefillMs).toBe(1_500)
+      expect(firstTrail?.thinkingPrefillNewTokens).toBe(5_000)
+
+      // Call 2: the next block arms a fresh clock and gets its own count.
+      vi.advanceTimersByTime(800)
+      onEvent({ payload: { text: 'second answer' }, type: 'message.delta' } as any)
+      onEvent({
+        payload: { text: 'second answer', usage: { last_call: { prompt: 10_000, cache_read: 9_900, new: 100 } } },
+        type: 'message.complete'
+      } as any)
+
+      const final = appended[appended.length - 1]
+      expect(final?.textPrefillMs).toBe(800)
+      expect(final?.textPrefillNewTokens).toBe(100)
+
+      // The earlier reasoning block keeps its own count — the final
+      // message.complete must not overwrite it with the last call's.
+      const trail = appended.find(msg => msg.thinking)
+      expect(trail?.thinkingPrefillNewTokens).toBe(5_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not stamp new tokens when the server omitted usage', () => {
+    vi.useFakeTimers()
+
+    try {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(900)
+      onEvent({ payload: { text: 'no usage here' }, type: 'message.delta' } as any)
+      onEvent({ payload: { text: 'no usage here' }, type: 'message.complete' } as any)
+
+      const final = appended[appended.length - 1]
+      expect(final?.textPrefillMs).toBe(900)
+      expect(final?.textPrefillNewTokens).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('updates the live text block timing in realtime (decode counts up, prefill fixed)', () => {
+    vi.useFakeTimers()
+
+    try {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      vi.advanceTimersByTime(1_200) // prefill wait
+      onEvent({ payload: { text: 'live text' }, type: 'message.delta' } as any)
+      vi.advanceTimersByTime(500) // past the stream batch delay
+      const mid = getTurnState().streamTiming
+
+      onEvent({ payload: { text: ' more' }, type: 'message.delta' } as any)
+      vi.advanceTimersByTime(2_000)
+      const later = getTurnState().streamTiming
+
+      // Prefill is captured once at the first token and never grows; decode
+      // counts up as the block streams, so the rendered tok/s is live.
+      expect(mid?.prefillMs).toBe(1_200)
+      expect(later?.prefillMs).toBe(1_200)
+      expect((later?.decodeMs ?? 0)).toBeGreaterThan(mid?.decodeMs ?? 0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drives the live prefill ticker: set during the wait, cleared at the first token', () => {
+    vi.useFakeTimers()
+
+    try {
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      // Submit anchors the live clock — the ticker renders and counts up.
+      turnController.armPrefillClock()
+      expect(getTurnState().prefillStartMs).toBeTypeOf('number')
+
+      vi.advanceTimersByTime(2500)
+      expect(getTurnState().prefillStartMs).toBeTypeOf('number')
+
+      // First reasoning token consumes it: ticker unmounts, the segment
+      // takes over with a frozen ↑ prefill and a ↓ decode starting at 0.
+      onEvent({ payload: { text: 'thinking' }, type: 'reasoning.delta' } as any)
+      const seg = getTurnState().streamSegments.at(-1)
+
+      expect(getTurnState().prefillStartMs).toBeNull()
+      expect(seg?.thinkingPrefillMs).toBe(2500)
+      expect(seg?.thinkingDurationMs).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('renders moa.reference as a labelled thinking-style segment', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
@@ -738,7 +1177,7 @@ describe('createGatewayEventHandler', () => {
     // Diff is already committed to segmentMessages as its own segment.
     expect(appended).toHaveLength(0)
     expect(turnController.segmentMessages).toEqual([
-      { role: 'assistant', text: 'Editing the file' },
+      { role: 'assistant', text: 'Editing the file', textDurationMs: expect.any(Number) },
       {
         kind: 'diff',
         role: 'assistant',

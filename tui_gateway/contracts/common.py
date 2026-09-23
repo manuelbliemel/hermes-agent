@@ -16,6 +16,16 @@ class OpenModel(Result):
     model_config = Result.model_config | {"extra": "allow"}
 
 
+class LastCallUsage(OpenModel):
+    """The most recent API call's prompt accounting (``agent._last_turn_usage``):
+    how much of the prompt the server actually prefilled vs served from cache.
+    ``new`` = prompt - cache_read (cache writes still pay full prefill)."""
+
+    prompt: int = 0
+    cache_read: int = 0
+    new: int = 0
+
+
 class Usage(OpenModel):
     """``tui_gateway/server.py::_get_usage`` + ``agent/context_breakdown.py::context_usage_fields``."""
 
@@ -42,6 +52,7 @@ class Usage(OpenModel):
     dev_credits_spent_micros: int | None = None
     cost_usd: float | None = None
     cost_status: str | None = None
+    last_call: LastCallUsage | None = None
 
 
 class ProjectRef(Result):

@@ -841,6 +841,10 @@ DEFAULT_CONFIG = {
         "background_process_notifications": "concise",
         "streaming": False,
         "timestamps": False,      # message timestamps (CLI labels, TUI rows, desktop transcript)
+        # TUI generation timing: ↑ prefill (time-to-first-token) / ↓ decode clocks,
+        # tok/s rates on thinking/response/tool-arg headers, and the live prefill +
+        # compaction tickers. Opt-in; off keeps the transcript chrome as before.
+        "generation_timing": False,
         "timestamp_format": "%H:%M",  # strftime format, e.g. "%b-%d %H:%M"
         "final_response_markdown": "strip",  # render | strip | raw
         # Preserve recent classic-CLI output across Ctrl+L, /redraw and resize clears; disable if an

@@ -13,11 +13,19 @@ const buildTurnState = (): TurnState => ({
   reasoningTokens: 0,
   streamPendingTools: [],
   streamSegments: [],
+  streamTiming: null,
+  // Live prefill (time-to-first-token) clock: set at submit, cleared when the
+  // first delta arrives. The Thinking header ticks ↑ against this during the
+  // wait so the user sees the prefill counting up from the moment of enter.
+  prefillStartMs: null,
   streaming: '',
   subagents: [],
   todoCollapsed: false,
   todos: [],
   toolTokens: 0,
+  toolGenDurationMs: null,
+  toolGenTokens: 0,
+  compactionStartMs: null,
   tools: [],
   turnTrail: []
 })
@@ -75,11 +83,20 @@ export interface TurnState {
   reasoningTokens: number
   streamPendingTools: string[]
   streamSegments: Msg[]
+  // Live generation timing for the in-flight text block, patched on each
+  // stream batch tick so duration / token speed update in realtime.
+  streamTiming: { decodeMs?: number; prefillMs?: number } | null
+  // Live prefill clock (see initial state). Non-null while waiting for the
+  // first token of the current model call.
+  prefillStartMs: number | null
   streaming: string
   subagents: SubagentProgress[]
   todoCollapsed: boolean
   todos: TodoItem[]
   toolTokens: number
+  toolGenDurationMs: number | null
+  toolGenTokens: number
+  compactionStartMs: number | null
   tools: ActiveTool[]
   turnTrail: string[]
 }
